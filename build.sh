@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-#ant clean && ant default
+ant clean && ant default
 cp -rf obj/release/prod/org/voltdb/utils/MiscUtils*.class voltdb/entreprise/org/voltdb/utils
 
 cd voltdb/entreprise
