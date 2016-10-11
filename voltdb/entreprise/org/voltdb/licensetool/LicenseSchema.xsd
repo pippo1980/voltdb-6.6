@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+    WORTH READING:
+
+    This schema describes the Volt license file.
+    This file is created and schema validated using jaxb.
+
+    If you modify this schema, you must regenerate the jaxb
+    bindings. It's easy to do:
+
+    cd src/licensetool
+    xjc -p org.voltdb.licensetool.xml org/voltdb/licensetool/LicenseSchema.xsd
+
+    You can check that changes to this file produce a valid schema using
+    the public tool at http://www.w3.org/2001/03/webdata/xsv.
+
+    For more information about jaxb, see:
+    http://java.sun.com/developer/technicalArticles/WebServices/jaxb/
+  -->
+
+<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+            elementFormDefault="unqualified">
+
+  <!--  <license> -->
+  <xsd:element name="license" type="licenseType"/>
+  <xsd:complexType name="licenseType">
+    <xsd:sequence>
+      <xsd:element name="permit" minOccurs='1' maxOccurs='1' type="permitType"/>
+      <xsd:element name="signature" minOccurs='1' maxOccurs='1' type="xsd:string"/>
+    </xsd:sequence>
+  </xsd:complexType>
+
+  <!-- <permit> -->
+  <xsd:complexType name="permitType">
+    <xsd:all>
+      <xsd:element name="issuer"     minOccurs='1' maxOccurs='1' type="issuerType"/>
+      <xsd:element name="expiration" minOccurs='1' maxOccurs='1' type="xsd:date"/>
+      <xsd:element name="hostcount"  minOccurs='1' maxOccurs='1' type="hostcountType"/>
+      <xsd:element name="features"   minOccurs='1' maxOccurs='1' type='featuresType'/>
+    </xsd:all>
+    <xsd:attribute name="version" type="xsd:int" default="1"/>
+  </xsd:complexType>
+
+  <!-- <issuer> -->
+  <xsd:complexType name="issuerType">
+    <xsd:all>
+      <!-- elements of an all group may appear in any order at most once. -->
+      <xsd:element name="company" type="xsd:string" minOccurs="1"/>
+      <xsd:element name="email" type="xsd:string" minOccurs="1"/>
+      <xsd:element name="url" type="xsd:string" minOccurs="1"/>
+      <xsd:element name="phone" type="xsd:string" minOccurs="0"/>
+    </xsd:all>
+  </xsd:complexType>
+
+  <!--  <release> -->
+  <xsd:complexType name="hostcountType">
+    <xsd:attribute name="max" type="xsd:int" use="required"  />
+  </xsd:complexType>
+
+  <!-- <issuer> -->
+  <xsd:complexType name="featuresType">
+    <xsd:sequence>
+        <!-- Unrestricted enables all features -->
+        <xsd:element name="unrestricted"   type="xsd:boolean" minOccurs='0' maxOccurs='1'/>
+        <xsd:element name="commandlogging" type="xsd:boolean" minOccurs='0' maxOccurs='1'/>
+        <xsd:element name="wanreplication" type="xsd:boolean" minOccurs='0' maxOccurs='1'/>
+        <xsd:element name="dractiveactive" type="xsd:boolean" minOccurs='0' maxOccurs='1'/>
+    </xsd:sequence>
+    <xsd:attribute name="trial" type="xsd:boolean"/>
+  </xsd:complexType>
+
+</xsd:schema>

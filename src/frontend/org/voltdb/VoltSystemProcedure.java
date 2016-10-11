@@ -1,0 +1,279 @@
+/* This file is part of VoltDB.
+ * Copyright (C) 2008-2016 VoltDB Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with VoltDB.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+package org.voltdb;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+import org.apache.commons.lang3.ArrayUtils;
+import org.voltcore.logging.VoltLogger;
+import org.voltdb.VoltTable.ColumnInfo;
+import org.voltdb.catalog.Cluster;
+import org.voltdb.catalog.Procedure;
+import org.voltdb.client.ClientResponse;
+import org.voltdb.dtxn.DtxnConstants;
+import org.voltdb.dtxn.TransactionState;
+import org.voltdb.dtxn.UndoAction;
+import org.voltdb.iv2.MpTransactionState;
+import org.voltdb.messaging.FragmentTaskMessage;
+import org.voltdb.settings.ClusterSettings;
+
+import com.google_voltpatches.common.primitives.Longs;
+
+/**
+ * System procedures extend VoltSystemProcedure and use its utility methods to
+ * create work in the system. This functionality is not available to standard
+ * user procedures (which extend VoltProcedure).
+ */
+public abstract class VoltSystemProcedure extends VoltProcedure {
+
+    private static final VoltLogger log = new VoltLogger("HOST");
+
+    /** Standard column type for host/partition/site id columns */
+    public static final VoltType CTYPE_ID = VoltType.INTEGER;
+
+    /** Standard column name for a host id column */
+    public static final String CNAME_HOST_ID = "HOST_ID";
+
+    /** Standard column name for a site id column */
+    public static final String CNAME_SITE_ID = "SITE_ID";
+
+    /** Standard column name for a partition id column */
+    public static final String CNAME_PARTITION_ID = "PARTITION_ID";
+
+    /** Standard schema for sysprocs returning a simple status table */
+    public static final ColumnInfo STATUS_SCHEMA =
+        new ColumnInfo("STATUS", VoltType.BIGINT);   // public to fix javadoc linking warning
+
+    /** Standard success return value for sysprocs returning STATUS_SCHEMA */
+    protected static long STATUS_OK = 0L;
+    protected static long STATUS_FAILURE = 1L;
+
+    protected Procedure m_catProc;
+    protected Cluster m_cluster;
+    protected ClusterSettings m_settings;
+    protected SiteProcedureConnection m_site;
+    private LoadedProcedureSet m_loadedProcedureSet;
+    protected ProcedureRunner m_runner; // overrides private parent var
+
+    /**
+     * Since sysprocs still use long fragids in places (rather than sha1 hashes),
+     * provide a utility method to convert between longs and hashes. This method
+     * is the inverse of {@link VoltSystemProcedure#fragIdToHash(long)}.
+     *
+     * @param hash 20bytes of hash value (last 12 bytes ignored)
+     * @return 8 bytes of fragid
+     */
+    public static long hashToFragId(byte[] hash) {
+        return Longs.fromByteArray(hash);
+    }
+
+    /**
+     * Since sysprocs still use long fragids in places (rather than sha1 hashes),
+     * provide a utility method to convert between longs and hashes. This method
+     * is the inverse of {@link VoltSystemProcedure#hashToFragId(byte[])}.
+     *
+     * @param fragId 8 bytes of frag id
+     * @return 20 bytes of hash padded with 12 empty bytes
+     */
+    public static byte[] fragIdToHash(long fragId) {
+        // use 12 bytes to pad the fake 20-byte sha1 hash after the 8-byte long
+        return ArrayUtils.addAll(Longs.toByteArray(fragId), new byte[12]);
+    }
+
+    @Override
+    void init(ProcedureRunner procRunner) {
+        super.init(procRunner);
+        m_runner = procRunner;
+    }
+
+    void initSysProc(SiteProcedureConnection site,
+            LoadedProcedureSet loadedProcedureSet,
+            Procedure catProc, Cluster cluster,
+            ClusterSettings settings) {
+
+        m_site = site;
+        m_catProc = catProc;
+        m_cluster = cluster;
+        m_settings = settings;
+        m_loadedProcedureSet = loadedProcedureSet;
+
+        init();
+    }
+
+    /**
+     * For Sysproc init tasks like registering plan frags
+     */
+    abstract public void init();
+
+    /** Bundles the data needed to describe a plan fragment. */
+    public static class SynthesizedPlanFragment {
+        public long siteId = -1;
+        public long fragmentId = -1;
+        public int outputDepId = -1;
+        public int inputDepIds[] = null;
+        public ParameterSet parameters = null;
+        public boolean multipartition = false;
+        /** true if distributes to all executable partitions */
+        /**
+         * Used to tell the DTXN to suppress duplicate results from sites that
+         * replicate a partition. Most system procedures don't want this, but,
+         * for example, adhoc queries actually do want duplicate suppression
+         * like user sysprocs.
+         */
+        public boolean suppressDuplicates = false;
+    }
+
+    abstract public DependencyPair executePlanFragment(
+            Map<Integer, List<VoltTable>> dependencies, long fragmentId,
+            ParameterSet params,
+            SystemProcedureExecutionContext context);
+
+    /**
+     * Produce work units, possibly on all sites, for a list of plan fragments.
+     * The final plan fragment must aggregate intermediate results and produce a
+     * single output dependency. This aggregate output is returned as the
+     * result.
+     *
+     * @param pfs
+     *            an array of synthesized plan fragments
+     * @param aggregatorOutputDependencyId
+     *            dependency id produced by the aggregation pf The id of the
+     *            table returned as the result of this procedure.
+     * @return the resulting VoltTable as a length-one array.
+     */
+    public VoltTable[] executeSysProcPlanFragments(
+            SynthesizedPlanFragment pfs[], int aggregatorOutputDependencyId) {
+
+        TransactionState txnState = m_runner.getTxnState();
+
+        // the stack frame drop terminates the recursion and resumes
+        // execution of the current stored procedure.
+        assert (txnState != null);
+        txnState.setupProcedureResume(false, new int[] { aggregatorOutputDependencyId });
+
+        final ArrayList<VoltTable> results = new ArrayList<>();
+        executeSysProcPlanFragmentsAsync(pfs);
+
+        // execute the tasks that just got queued.
+        // recursively call recurableRun and don't allow it to shutdown
+        Map<Integer, List<VoltTable>> mapResults = m_site.recursableRun(txnState);
+
+        if (mapResults != null) {
+            List<VoltTable> matchingTablesForId = mapResults.get(aggregatorOutputDependencyId);
+            if (matchingTablesForId == null) {
+                log.error("Sysproc received a stale fragment response message from before the " +
+                          "transaction restart.");
+                throw new MpTransactionState.FragmentFailureException();
+            } else {
+                results.add(matchingTablesForId.get(0));
+            }
+        }
+
+        return results.toArray(new VoltTable[0]);
+    }
+
+    /**
+     * Produce work units, possibly on all sites, for a list of plan fragments.
+     * The final plan fragment must aggregate intermediate results and produce a
+     * single output dependency. This aggregate output is returned as the
+     * result.
+     *
+     * @param pfs
+     *            an array of synthesized plan fragments
+     * @param aggregatorOutputDependencyId
+     *            dependency id produced by the aggregation pf The id of the
+     *            table returned as the result of this procedure.
+     */
+    public void executeSysProcPlanFragmentsAsync(
+            SynthesizedPlanFragment pfs[]) {
+
+        TransactionState txnState = m_runner.getTxnState();
+
+        for (SynthesizedPlanFragment pf : pfs) {
+            assert (pf.parameters != null);
+
+            // check the output dep id makes sense given the number of sites to
+            // run this on
+            if (pf.multipartition) {
+                assert ((pf.outputDepId & DtxnConstants.MULTIPARTITION_DEPENDENCY) == DtxnConstants.MULTIPARTITION_DEPENDENCY);
+            }
+
+            FragmentTaskMessage task = FragmentTaskMessage.createWithOneFragment(
+                    txnState.initiatorHSId,
+                    m_site.getCorrespondingSiteId(),
+                    txnState.txnId,
+                    txnState.uniqueId,
+                    txnState.isReadOnly(),
+                    fragIdToHash(pf.fragmentId),
+                    pf.outputDepId,
+                    pf.parameters,
+                    false,
+                    txnState.isForReplay());
+            if (pf.inputDepIds != null) {
+                for (int depId : pf.inputDepIds) {
+                    task.addInputDepId(0, depId);
+                }
+            }
+            task.setFragmentTaskType(FragmentTaskMessage.SYS_PROC_PER_SITE);
+            if (pf.suppressDuplicates) {
+                task.setFragmentTaskType(FragmentTaskMessage.SYS_PROC_PER_PARTITION);
+            }
+
+            if (pf.multipartition) {
+                // create a workunit for every execution site
+                txnState.createAllParticipatingFragmentWork(task);
+            } else {
+                // create one workunit for the current site
+                if (pf.siteId == -1)
+                    txnState.createLocalFragmentWork(task, false);
+                else
+                    txnState.createFragmentWork(new long[] { pf.siteId },
+                                                         task);
+            }
+        }
+    }
+
+    // It would be nicer if init() on a sysproc was really "getPlanFragmentIds()"
+    // and then the loader could ask for the ids directly instead of stashing
+    // its reference here and inverting the relationship between loaded procedure
+    // set and system procedure.
+    public void registerPlanFragment(long fragmentId) {
+        assert(m_runner != null);
+        m_loadedProcedureSet.registerPlanFragment(fragmentId, m_runner);
+    }
+
+    protected void noteOperationalFailure(String errMsg) {
+        m_runner.m_statusCode = ClientResponse.OPERATIONAL_FAILURE;
+        m_runner.m_statusString = errMsg;
+    }
+
+    protected void registerUndoAction(UndoAction action) {
+        m_runner.getTxnState().registerUndoAction(action);
+    }
+
+    protected Long getMasterHSId(int partition) {
+        TransactionState txnState = m_runner.getTxnState();
+        if (txnState instanceof MpTransactionState) {
+            return ((MpTransactionState) txnState).getMasterHSId(partition);
+        } else {
+            throw new RuntimeException("SP sysproc doesn't support getting the master HSID");
+        }
+    }
+}
